@@ -114,6 +114,12 @@ pub type ColumnReaderImpl<T> = GenericColumnReader<
 /// - D: `ColumnLevelDecoder` used to decode definition levels
 /// - V: `ColumnValueDecoder` used to decode value data
 pub struct GenericColumnReader<R, D, V> {
+    inner: GenericColumnReaderInner<R, D>,
+    /// The decoder for the values
+    values_decoder: V,
+}
+
+struct GenericColumnReaderInner<R, D> {
     descr: ColumnDescPtr,
 
     page_reader: Box<dyn PageReader>,
@@ -130,9 +136,6 @@ pub struct GenericColumnReader<R, D, V> {
 
     /// The decoder for the repetition levels if any
     rep_level_decoder: Option<R>,
-
-    /// The decoder for the values
-    values_decoder: V,
 }
 
 impl<V> GenericColumnReader<ColumnLevelDecoderImpl, ColumnLevelDecoderImpl, V>
@@ -173,12 +176,14 @@ where
         rep_level_decoder: Option<R>,
     ) -> Self {
         Self {
-            descr,
-            def_level_decoder,
-            rep_level_decoder,
-            page_reader,
-            num_buffered_values: 0,
-            num_decoded_values: 0,
+            inner: GenericColumnReaderInner {
+                descr,
+                def_level_decoder,
+                rep_level_decoder,
+                page_reader,
+                num_buffered_values: 0,
+                num_decoded_values: 0,
+            },
             values_decoder,
         }
     }
@@ -222,17 +227,19 @@ where
             }
 
             // Batch size for the current iteration
-            let iter_batch_size = (batch_size - levels_read)
-                .min((self.num_buffered_values - self.num_decoded_values) as usize);
+            let iter_batch_size = (batch_size - levels_read).min(
+                (self.inner.num_buffered_values - self.inner.num_decoded_values) as usize,
+            );
 
             // If the field is required and non-repeated, there are no definition levels
-            let null_count = match self.descr.max_def_level() > 0 {
+            let null_count = match self.inner.descr.max_def_level() > 0 {
                 true => {
                     let levels = def_levels
                         .as_mut()
                         .ok_or_else(|| general_err!("must specify definition levels"))?;
 
                     let num_def_levels = self
+                        .inner
                         .def_level_decoder
                         .as_mut()
                         .expect("def_level_decoder be set")
@@ -244,18 +251,19 @@ where
 
                     levels.count_nulls(
                         levels_read..levels_read + num_def_levels,
-                        self.descr.max_def_level(),
+                        self.inner.descr.max_def_level(),
                     )
                 }
                 false => 0,
             };
 
-            if self.descr.max_rep_level() > 0 {
+            if self.inner.descr.max_rep_level() > 0 {
                 let levels = rep_levels
                     .as_mut()
                     .ok_or_else(|| general_err!("must specify repetition levels"))?;
 
                 let rep_levels = self
+                    .inner
                     .rep_level_decoder
                     .as_mut()
                     .expect("rep_level_decoder be set")
@@ -282,7 +290,7 @@ where
             // Update all "return" counters and internal state.
 
             // This is to account for when def or rep levels are not provided
-            self.num_decoded_values += iter_batch_size as u32;
+            self.inner.num_decoded_values += iter_batch_size as u32;
             levels_read += iter_batch_size;
             values_read += curr_values_read;
         }
@@ -298,8 +306,8 @@ where
     pub fn skip_records(&mut self, num_records: usize) -> Result<usize> {
         let mut remaining = num_records;
         while remaining != 0 {
-            if self.num_buffered_values == self.num_decoded_values {
-                let metadata = match self.page_reader.peek_next_page()? {
+            if self.inner.num_buffered_values == self.inner.num_decoded_values {
+                let metadata = match self.inner.page_reader.peek_next_page()? {
                     None => return Ok(num_records - remaining),
                     Some(metadata) => metadata,
                 };
@@ -313,7 +321,7 @@ where
                 // If page has less rows than the remaining records to
                 // be skipped, skip entire page
                 if metadata.num_rows < remaining {
-                    self.page_reader.skip_next_page()?;
+                    self.inner.page_reader.skip_next_page()?;
                     remaining -= metadata.num_rows;
                     continue;
                 };
@@ -325,19 +333,24 @@ where
             }
 
             // start skip values in page level
-            let to_read = remaining
-                .min((self.num_buffered_values - self.num_decoded_values) as usize);
+            let to_read = remaining.min(
+                (self.inner.num_buffered_values - self.inner.num_decoded_values) as usize,
+            );
 
-            let (records_read, rep_levels_read) = match self.rep_level_decoder.as_mut() {
-                Some(decoder) => decoder.skip_rep_levels(to_read)?,
-                None => (to_read, to_read),
-            };
+            let (records_read, rep_levels_read) =
+                match self.inner.rep_level_decoder.as_mut() {
+                    Some(decoder) => decoder.skip_rep_levels(to_read)?,
+                    None => (to_read, to_read),
+                };
 
-            let (values_read, def_levels_read) = match self.def_level_decoder.as_mut() {
-                Some(decoder) => decoder
-                    .skip_def_levels(rep_levels_read, self.descr.max_def_level())?,
-                None => (rep_levels_read, rep_levels_read),
-            };
+            let (values_read, def_levels_read) =
+                match self.inner.def_level_decoder.as_mut() {
+                    Some(decoder) => decoder.skip_def_levels(
+                        rep_levels_read,
+                        self.inner.descr.max_def_level(),
+                    )?,
+                    None => (rep_levels_read, rep_levels_read),
+                };
 
             if rep_levels_read != def_levels_read {
                 return Err(general_err!(
@@ -356,7 +369,7 @@ where
                 ));
             }
 
-            self.num_decoded_values += rep_levels_read as u32;
+            self.inner.num_decoded_values += rep_levels_read as u32;
             remaining -= records_read;
         }
         Ok(num_records - remaining)
@@ -366,147 +379,199 @@ where
     /// Returns false if there's no page left.
     fn read_new_page(&mut self) -> Result<bool> {
         loop {
-            match self.page_reader.get_next_page()? {
+            match self.inner.get_next_page()? {
                 // No more page to read
                 None => return Ok(false),
-                Some(current_page) => {
-                    match current_page {
-                        // 1. Dictionary page: configure dictionary for this page.
-                        Page::DictionaryPage {
-                            buf,
-                            num_values,
-                            encoding,
-                            is_sorted,
-                        } => {
-                            self.values_decoder
-                                .set_dict(buf, num_values, encoding, is_sorted)?;
-                            continue;
-                        }
-                        // 2. Data page v1
-                        Page::DataPage {
-                            buf,
-                            num_values,
-                            encoding,
-                            def_level_encoding,
-                            rep_level_encoding,
-                            statistics: _,
-                        } => {
-                            self.num_buffered_values = num_values;
-                            self.num_decoded_values = 0;
-
-                            let max_rep_level = self.descr.max_rep_level();
-                            let max_def_level = self.descr.max_def_level();
-
-                            let mut offset = 0;
-
-                            if max_rep_level > 0 {
-                                let (bytes_read, level_data) = parse_v1_level(
-                                    max_rep_level,
-                                    num_values,
-                                    rep_level_encoding,
-                                    buf.start_from(offset),
-                                )?;
-                                offset += bytes_read;
-
-                                self.rep_level_decoder
-                                    .as_mut()
-                                    .unwrap()
-                                    .set_data(rep_level_encoding, level_data);
-                            }
-
-                            if max_def_level > 0 {
-                                let (bytes_read, level_data) = parse_v1_level(
-                                    max_def_level,
-                                    num_values,
-                                    def_level_encoding,
-                                    buf.start_from(offset),
-                                )?;
-                                offset += bytes_read;
-
-                                self.def_level_decoder
-                                    .as_mut()
-                                    .unwrap()
-                                    .set_data(def_level_encoding, level_data);
-                            }
-
-                            self.values_decoder.set_data(
-                                encoding,
-                                buf.start_from(offset),
-                                num_values as usize,
-                                None,
-                            )?;
-                            return Ok(true);
-                        }
-                        // 3. Data page v2
-                        Page::DataPageV2 {
-                            buf,
-                            num_values,
-                            encoding,
-                            num_nulls,
-                            num_rows: _,
-                            def_levels_byte_len,
-                            rep_levels_byte_len,
-                            is_compressed: _,
-                            statistics: _,
-                        } => {
-                            if num_nulls > num_values {
-                                return Err(general_err!("more nulls than values in page, contained {} values and {} nulls", num_values, num_nulls));
-                            }
-
-                            self.num_buffered_values = num_values;
-                            self.num_decoded_values = 0;
-
-                            // DataPage v2 only supports RLE encoding for repetition
-                            // levels
-                            if self.descr.max_rep_level() > 0 {
-                                self.rep_level_decoder.as_mut().unwrap().set_data(
-                                    Encoding::RLE,
-                                    buf.range(0, rep_levels_byte_len as usize),
-                                );
-                            }
-
-                            // DataPage v2 only supports RLE encoding for definition
-                            // levels
-                            if self.descr.max_def_level() > 0 {
-                                self.def_level_decoder.as_mut().unwrap().set_data(
-                                    Encoding::RLE,
-                                    buf.range(
-                                        rep_levels_byte_len as usize,
-                                        def_levels_byte_len as usize,
-                                    ),
-                                );
-                            }
-
-                            self.values_decoder.set_data(
-                                encoding,
-                                buf.start_from(
-                                    (rep_levels_byte_len + def_levels_byte_len) as usize,
-                                ),
-                                num_values as usize,
-                                Some((num_values - num_nulls) as usize),
-                            )?;
-                            return Ok(true);
-                        }
-                    };
-                }
+                Some(current_page) => match current_page {
+                    ReadPage::SetDictionary {
+                        buf,
+                        num_values,
+                        encoding,
+                        is_sorted,
+                    } => {
+                        self.values_decoder
+                            .set_dict(buf, num_values, encoding, is_sorted)?;
+                        continue;
+                    }
+                    ReadPage::SetData {
+                        encoding,
+                        data,
+                        num_levels,
+                        num_values,
+                    } => {
+                        self.values_decoder
+                            .set_data(encoding, data, num_levels, num_values)?;
+                        return Ok(true);
+                    }
+                },
             }
         }
     }
 
     #[inline]
     pub(crate) fn has_next(&mut self) -> Result<bool> {
-        if self.num_buffered_values == 0
-            || self.num_buffered_values == self.num_decoded_values
+        if self.inner.num_buffered_values == 0
+            || self.inner.num_buffered_values == self.inner.num_decoded_values
         {
             // TODO: should we return false if read_new_page() = true and
             // num_buffered_values = 0?
             if !self.read_new_page()? {
                 Ok(false)
             } else {
-                Ok(self.num_buffered_values != 0)
+                Ok(self.inner.num_buffered_values != 0)
             }
         } else {
             Ok(true)
+        }
+    }
+}
+
+enum ReadPage {
+    SetDictionary {
+        buf: ByteBufferPtr,
+        num_values: u32,
+        encoding: Encoding,
+        is_sorted: bool,
+    },
+
+    SetData {
+        encoding: Encoding,
+        data: ByteBufferPtr,
+        num_levels: usize,
+        num_values: Option<usize>,
+    },
+}
+
+impl<R, D> GenericColumnReaderInner<R, D>
+where
+    R: RepetitionLevelDecoder,
+    D: DefinitionLevelDecoder,
+{
+    /// Reads a new page and set up the decoders for levels, values or dictionary.
+    /// Returns false if there's no page left.
+    fn get_next_page(&mut self) -> Result<Option<ReadPage>> {
+        match self.page_reader.get_next_page()? {
+            // No more page to read
+            None => return Ok(None),
+            Some(current_page) => {
+                match current_page {
+                    // 1. Dictionary page: configure dictionary for this page.
+                    Page::DictionaryPage {
+                        buf,
+                        num_values,
+                        encoding,
+                        is_sorted,
+                    } => Ok(Some(ReadPage::SetDictionary {
+                        buf,
+                        num_values,
+                        encoding,
+                        is_sorted,
+                    })),
+                    // 2. Data page v1
+                    Page::DataPage {
+                        buf,
+                        num_values,
+                        encoding,
+                        def_level_encoding,
+                        rep_level_encoding,
+                        statistics: _,
+                    } => {
+                        self.num_buffered_values = num_values;
+                        self.num_decoded_values = 0;
+
+                        let max_rep_level = self.descr.max_rep_level();
+                        let max_def_level = self.descr.max_def_level();
+
+                        let mut offset = 0;
+
+                        if max_rep_level > 0 {
+                            let (bytes_read, level_data) = parse_v1_level(
+                                max_rep_level,
+                                num_values,
+                                rep_level_encoding,
+                                buf.start_from(offset),
+                            )?;
+                            offset += bytes_read;
+
+                            self.rep_level_decoder
+                                .as_mut()
+                                .unwrap()
+                                .set_data(rep_level_encoding, level_data);
+                        }
+
+                        if max_def_level > 0 {
+                            let (bytes_read, level_data) = parse_v1_level(
+                                max_def_level,
+                                num_values,
+                                def_level_encoding,
+                                buf.start_from(offset),
+                            )?;
+                            offset += bytes_read;
+
+                            self.def_level_decoder
+                                .as_mut()
+                                .unwrap()
+                                .set_data(def_level_encoding, level_data);
+                        }
+
+                        Ok(Some(ReadPage::SetData {
+                            encoding,
+                            data: buf.start_from(offset),
+                            num_levels: num_values as usize,
+                            num_values: None,
+                        }))
+                    }
+                    // 3. Data page v2
+                    Page::DataPageV2 {
+                        buf,
+                        num_values,
+                        encoding,
+                        num_nulls,
+                        num_rows: _,
+                        def_levels_byte_len,
+                        rep_levels_byte_len,
+                        is_compressed: _,
+                        statistics: _,
+                    } => {
+                        if num_nulls > num_values {
+                            return Err(general_err!("more nulls than values in page, contained {} values and {} nulls", num_values, num_nulls));
+                        }
+
+                        self.num_buffered_values = num_values;
+                        self.num_decoded_values = 0;
+
+                        // DataPage v2 only supports RLE encoding for repetition
+                        // levels
+                        if self.descr.max_rep_level() > 0 {
+                            self.rep_level_decoder.as_mut().unwrap().set_data(
+                                Encoding::RLE,
+                                buf.range(0, rep_levels_byte_len as usize),
+                            );
+                        }
+
+                        // DataPage v2 only supports RLE encoding for definition
+                        // levels
+                        if self.descr.max_def_level() > 0 {
+                            self.def_level_decoder.as_mut().unwrap().set_data(
+                                Encoding::RLE,
+                                buf.range(
+                                    rep_levels_byte_len as usize,
+                                    def_levels_byte_len as usize,
+                                ),
+                            );
+                        }
+
+                        Ok(Some(ReadPage::SetData {
+                            encoding,
+                            data: buf.start_from(
+                                (rep_levels_byte_len + def_levels_byte_len) as usize,
+                            ),
+                            num_levels: num_values as usize,
+                            num_values: Some((num_values - num_nulls) as usize),
+                        }))
+                    }
+                }
+            }
         }
     }
 }
