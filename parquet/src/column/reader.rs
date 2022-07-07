@@ -231,48 +231,17 @@ where
                 (self.inner.num_buffered_values - self.inner.num_decoded_values) as usize,
             );
 
-            // If the field is required and non-repeated, there are no definition levels
-            let null_count = match self.inner.descr.max_def_level() > 0 {
-                true => {
-                    let levels = def_levels
-                        .as_mut()
-                        .ok_or_else(|| general_err!("must specify definition levels"))?;
+            let null_count = self.inner.read_null_count(
+                def_levels.as_deref_mut(),
+                levels_read,
+                iter_batch_size,
+            )?;
 
-                    let num_def_levels = self
-                        .inner
-                        .def_level_decoder
-                        .as_mut()
-                        .expect("def_level_decoder be set")
-                        .read(levels, levels_read..levels_read + iter_batch_size)?;
-
-                    if num_def_levels != iter_batch_size {
-                        return Err(general_err!("insufficient definition levels read from column - expected {}, got {}", iter_batch_size, num_def_levels));
-                    }
-
-                    levels.count_nulls(
-                        levels_read..levels_read + num_def_levels,
-                        self.inner.descr.max_def_level(),
-                    )
-                }
-                false => 0,
-            };
-
-            if self.inner.descr.max_rep_level() > 0 {
-                let levels = rep_levels
-                    .as_mut()
-                    .ok_or_else(|| general_err!("must specify repetition levels"))?;
-
-                let rep_levels = self
-                    .inner
-                    .rep_level_decoder
-                    .as_mut()
-                    .expect("rep_level_decoder be set")
-                    .read(levels, levels_read..levels_read + iter_batch_size)?;
-
-                if rep_levels != iter_batch_size {
-                    return Err(general_err!("insufficient repetition levels read from column - expected {}, got {}", iter_batch_size, rep_levels));
-                }
-            }
+            self.inner.read_repetitions(
+                rep_levels.as_deref_mut(),
+                levels_read,
+                iter_batch_size,
+            )?;
 
             let values_to_read = iter_batch_size - null_count;
             let curr_values_read = self
@@ -447,6 +416,61 @@ where
     R: RepetitionLevelDecoder,
     D: DefinitionLevelDecoder,
 {
+    fn read_null_count(
+        &mut self,
+        def_levels: Option<&mut D::Slice>,
+        levels_read: usize,
+        iter_batch_size: usize,
+    ) -> Result<usize> {
+        // If the field is required and non-repeated, there are no definition levels
+        let null_count = match self.descr.max_def_level() > 0 {
+            true => {
+                let levels = def_levels
+                    .ok_or_else(|| general_err!("must specify definition levels"))?;
+
+                let num_def_levels = self
+                    .def_level_decoder
+                    .as_mut()
+                    .expect("def_level_decoder be set")
+                    .read(levels, levels_read..levels_read + iter_batch_size)?;
+
+                if num_def_levels != iter_batch_size {
+                    return Err(general_err!("insufficient definition levels read from column - expected {}, got {}", iter_batch_size, num_def_levels));
+                }
+
+                levels.count_nulls(
+                    levels_read..levels_read + num_def_levels,
+                    self.descr.max_def_level(),
+                )
+            }
+            false => 0,
+        };
+        Ok(null_count)
+    }
+
+    fn read_repetitions(
+        &mut self,
+        rep_levels: Option<&mut R::Slice>,
+        levels_read: usize,
+        iter_batch_size: usize,
+    ) -> Result<()> {
+        if self.descr.max_rep_level() > 0 {
+            let levels = rep_levels
+                .ok_or_else(|| general_err!("must specify repetition levels"))?;
+
+            let rep_levels = self
+                .rep_level_decoder
+                .as_mut()
+                .expect("rep_level_decoder be set")
+                .read(levels, levels_read..levels_read + iter_batch_size)?;
+
+            if rep_levels != iter_batch_size {
+                return Err(general_err!("insufficient repetition levels read from column - expected {}, got {}", iter_batch_size, rep_levels));
+            }
+        }
+        Ok(())
+    }
+
     /// Reads a new page and set up the decoders for levels, values or dictionary.
     /// Returns false if there's no page left.
     fn get_next_page(&mut self) -> Result<Option<ReadPage>> {
