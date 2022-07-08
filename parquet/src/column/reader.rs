@@ -226,24 +226,13 @@ where
                 break;
             }
 
-            // Batch size for the current iteration
-            let iter_batch_size = (batch_size - levels_read).min(
-                (self.inner.num_buffered_values - self.inner.num_decoded_values) as usize,
-            );
-
-            let null_count = self.inner.read_null_count(
+            let (iter_batch_size, values_to_read) = self.inner.begin_read_batch(
+                batch_size,
                 def_levels.as_deref_mut(),
-                levels_read,
-                iter_batch_size,
-            )?;
-
-            self.inner.read_repetitions(
                 rep_levels.as_deref_mut(),
                 levels_read,
-                iter_batch_size,
             )?;
 
-            let values_to_read = iter_batch_size - null_count;
             let curr_values_read = self
                 .values_decoder
                 .read(values, values_read..values_read + values_to_read)?;
@@ -416,6 +405,27 @@ where
     R: RepetitionLevelDecoder,
     D: DefinitionLevelDecoder,
 {
+    fn begin_read_batch(
+        &mut self,
+        batch_size: usize,
+        def_levels: Option<&mut D::Slice>,
+        rep_levels: Option<&mut R::Slice>,
+        levels_read: usize,
+    ) -> Result<(usize, usize)> {
+        // Batch size for the current iteration
+        let iter_batch_size = (batch_size - levels_read)
+            .min((self.num_buffered_values - self.num_decoded_values) as usize);
+
+        let null_count =
+            self.read_null_count(def_levels, levels_read, iter_batch_size)?;
+
+        self.read_repetitions(rep_levels, levels_read, iter_batch_size)?;
+
+        let values_to_read = iter_batch_size - null_count;
+
+        Ok((iter_batch_size, values_to_read))
+    }
+
     fn read_null_count(
         &mut self,
         def_levels: Option<&mut D::Slice>,
