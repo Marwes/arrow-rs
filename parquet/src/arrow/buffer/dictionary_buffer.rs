@@ -144,50 +144,63 @@ impl<K: ScalarValue + ArrowNativeType + Ord, V: ScalarValue + OffsetSizeTrait>
 
         match self {
             Self::Dict { keys, values } => {
-                // Validate keys unless dictionary is empty
-                if !values.is_empty() {
-                    let min = K::from_usize(0).unwrap();
-                    let max = K::from_usize(values.len()).unwrap();
-
-                    // It may be possible to use SIMD here
-                    if keys.as_slice().iter().any(|x| *x < min || *x >= max) {
-                        return Err(general_err!(
-                            "dictionary key beyond bounds of dictionary: 0..{}",
-                            values.len()
-                        ));
-                    }
-                }
-
-                let builder = ArrayDataBuilder::new(data_type.clone())
-                    .len(keys.len())
-                    .add_buffer(keys.into())
-                    .add_child_data(values.into_data())
-                    .null_bit_buffer(null_buffer);
-
-                let data = match cfg!(debug_assertions) {
-                    true => builder.build().unwrap(),
-                    false => unsafe { builder.build_unchecked() },
-                };
-
-                Ok(make_array(data))
+                key_values_into_array(null_buffer, data_type, keys, values)
             }
-            Self::Values { values } => {
-                let value_type = match data_type {
-                    ArrowType::Dictionary(_, v) => v.as_ref().clone(),
-                    _ => unreachable!(),
-                };
-
-                // This will compute a new dictionary
-                let array = arrow::compute::cast(
-                    &values.into_array(null_buffer, value_type),
-                    data_type,
-                )
-                .expect("cast should be infallible");
-
-                Ok(array)
-            }
+            Self::Values { values } => values_into_array(null_buffer, data_type, values),
         }
     }
+}
+
+fn key_values_into_array<K: ScalarValue + ArrowNativeType + Ord>(
+    null_buffer: Option<Buffer>,
+    data_type: &ArrowType,
+    keys: ScalarBuffer<K>,
+    values: ArrayRef,
+) -> Result<ArrayRef> {
+    // Validate keys unless dictionary is empty
+    if !values.is_empty() {
+        let min = K::from_usize(0).unwrap();
+        let max = K::from_usize(values.len()).unwrap();
+
+        // It may be possible to use SIMD here
+        if keys.as_slice().iter().any(|x| *x < min || *x >= max) {
+            return Err(general_err!(
+                "dictionary key beyond bounds of dictionary: 0..{}",
+                values.len()
+            ));
+        }
+    }
+
+    let builder = ArrayDataBuilder::new(data_type.clone())
+        .len(keys.len())
+        .add_buffer(keys.into())
+        .add_child_data(values.into_data())
+        .null_bit_buffer(null_buffer);
+
+    let data = match cfg!(debug_assertions) {
+        true => builder.build().unwrap(),
+        false => unsafe { builder.build_unchecked() },
+    };
+
+    Ok(make_array(data))
+}
+
+fn values_into_array<V: ScalarValue + OffsetSizeTrait>(
+    null_buffer: Option<Buffer>,
+    data_type: &ArrowType,
+    values: OffsetBuffer<V>,
+) -> Result<ArrayRef> {
+    let value_type = match data_type {
+        ArrowType::Dictionary(_, v) => v.as_ref().clone(),
+        _ => unreachable!(),
+    };
+
+    // This will compute a new dictionary
+    let array =
+        arrow::compute::cast(&values.into_array(null_buffer, value_type), data_type)
+            .expect("cast should be infallible");
+
+    Ok(array)
 }
 
 impl<K: ScalarValue, V: ScalarValue> ValuesBufferSlice for DictionaryBuffer<K, V> {
