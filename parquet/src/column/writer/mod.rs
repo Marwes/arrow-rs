@@ -650,95 +650,18 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         // update column and offset index
         self.update_column_offset_index(&page_statistics);
 
-        let compressed_page = match self.props.writer_version() {
-            WriterVersion::PARQUET_1_0 => {
-                let mut buffer = vec![];
-
-                if max_rep_level > 0 {
-                    buffer.extend_from_slice(
-                        &self.encode_levels_v1(
-                            Encoding::RLE,
-                            &self.rep_levels_sink[..],
-                            max_rep_level,
-                        )[..],
-                    );
-                }
-
-                if max_def_level > 0 {
-                    buffer.extend_from_slice(
-                        &self.encode_levels_v1(
-                            Encoding::RLE,
-                            &self.def_levels_sink[..],
-                            max_def_level,
-                        )[..],
-                    );
-                }
-
-                buffer.extend_from_slice(values_data.buf.data());
-                let uncompressed_size = buffer.len();
-
-                if let Some(ref mut cmpr) = self.compressor {
-                    let mut compressed_buf = Vec::with_capacity(uncompressed_size);
-                    cmpr.compress(&buffer[..], &mut compressed_buf)?;
-                    buffer = compressed_buf;
-                }
-
-                let data_page = Page::DataPage {
-                    buf: ByteBufferPtr::new(buffer),
-                    num_values: self.page_metrics.num_buffered_values,
-                    encoding: values_data.encoding,
-                    def_level_encoding: Encoding::RLE,
-                    rep_level_encoding: Encoding::RLE,
-                    statistics: page_statistics,
-                };
-
-                CompressedPage::new(data_page, uncompressed_size)
-            }
-            WriterVersion::PARQUET_2_0 => {
-                let mut rep_levels_byte_len = 0;
-                let mut def_levels_byte_len = 0;
-                let mut buffer = vec![];
-
-                if max_rep_level > 0 {
-                    let levels =
-                        self.encode_levels_v2(&self.rep_levels_sink[..], max_rep_level);
-                    rep_levels_byte_len = levels.len();
-                    buffer.extend_from_slice(&levels[..]);
-                }
-
-                if max_def_level > 0 {
-                    let levels =
-                        self.encode_levels_v2(&self.def_levels_sink[..], max_def_level);
-                    def_levels_byte_len = levels.len();
-                    buffer.extend_from_slice(&levels[..]);
-                }
-
-                let uncompressed_size =
-                    rep_levels_byte_len + def_levels_byte_len + values_data.buf.len();
-
-                // Data Page v2 compresses values only.
-                match self.compressor {
-                    Some(ref mut cmpr) => {
-                        cmpr.compress(values_data.buf.data(), &mut buffer)?;
-                    }
-                    None => buffer.extend_from_slice(values_data.buf.data()),
-                }
-
-                let data_page = Page::DataPageV2 {
-                    buf: ByteBufferPtr::new(buffer),
-                    num_values: self.page_metrics.num_buffered_values,
-                    encoding: values_data.encoding,
-                    num_nulls: self.page_metrics.num_page_nulls as u32,
-                    num_rows: self.page_metrics.num_buffered_rows,
-                    def_levels_byte_len: def_levels_byte_len as u32,
-                    rep_levels_byte_len: rep_levels_byte_len as u32,
-                    is_compressed: self.compressor.is_some(),
-                    statistics: page_statistics,
-                };
-
-                CompressedPage::new(data_page, uncompressed_size)
-            }
-        };
+        let compressed_page = create_compressed_page(
+            &self.props,
+            values_data.encoding,
+            page_statistics,
+            self.compressor.as_deref_mut(),
+            max_rep_level,
+            &self.rep_levels_sink,
+            max_def_level,
+            &self.def_levels_sink,
+            &values_data.buf,
+            &self.page_metrics,
+        )?;
 
         // Check if we need to buffer data page or flush it to the sink directly.
         if self.encoder.has_dictionary() {
@@ -815,28 +738,6 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         self.page_writer.write_metadata(&metadata)?;
 
         Ok(metadata)
-    }
-
-    /// Encodes definition or repetition levels for Data Page v1.
-    #[inline]
-    fn encode_levels_v1(
-        &self,
-        encoding: Encoding,
-        levels: &[i16],
-        max_level: i16,
-    ) -> Vec<u8> {
-        let mut encoder = LevelEncoder::v1(encoding, max_level, levels.len());
-        encoder.put(levels);
-        encoder.consume()
-    }
-
-    /// Encodes definition or repetition levels for Data Page v2.
-    /// Encoding is always RLE.
-    #[inline]
-    fn encode_levels_v2(&self, levels: &[i16], max_level: i16) -> Vec<u8> {
-        let mut encoder = LevelEncoder::v2(max_level, levels.len());
-        encoder.put(levels);
-        encoder.consume()
     }
 
     /// Writes compressed data page into underlying sink and updates global metrics.
@@ -1000,6 +901,118 @@ fn compare_greater<T: ParquetValueType>(descr: &ColumnDescriptor, a: &T, b: &T) 
     };
 
     a > b
+}
+
+/// Encodes definition or repetition levels for Data Page v1.
+#[inline]
+fn encode_levels_v1(encoding: Encoding, levels: &[i16], max_level: i16) -> Vec<u8> {
+    let mut encoder = LevelEncoder::v1(encoding, max_level, levels.len());
+    encoder.put(levels);
+    encoder.consume()
+}
+
+/// Encodes definition or repetition levels for Data Page v2.
+/// Encoding is always RLE.
+#[inline]
+fn encode_levels_v2(levels: &[i16], max_level: i16) -> Vec<u8> {
+    let mut encoder = LevelEncoder::v2(max_level, levels.len());
+    encoder.put(levels);
+    encoder.consume()
+}
+
+fn create_compressed_page(
+    props: &WriterProperties,
+    encoding: Encoding,
+    page_statistics: Option<Statistics>,
+    mut compressor: Option<&mut (dyn Codec + '_)>,
+    max_rep_level: i16,
+    rep_levels_sink: &[i16],
+    max_def_level: i16,
+    def_levels_sink: &[i16],
+    values_data_buf: &ByteBufferPtr,
+    page_metrics: &PageMetrics,
+) -> Result<CompressedPage> {
+    Ok(match props.writer_version() {
+        WriterVersion::PARQUET_1_0 => {
+            let mut buffer = vec![];
+
+            if max_rep_level > 0 {
+                buffer.extend_from_slice(
+                    &encode_levels_v1(Encoding::RLE, &rep_levels_sink[..], max_rep_level)
+                        [..],
+                );
+            }
+
+            if max_def_level > 0 {
+                buffer.extend_from_slice(
+                    &encode_levels_v1(Encoding::RLE, &def_levels_sink[..], max_def_level)
+                        [..],
+                );
+            }
+
+            buffer.extend_from_slice(values_data_buf.data());
+            let uncompressed_size = buffer.len();
+
+            if let Some(ref mut cmpr) = compressor {
+                let mut compressed_buf = Vec::with_capacity(uncompressed_size);
+                cmpr.compress(&buffer[..], &mut compressed_buf)?;
+                buffer = compressed_buf;
+            }
+
+            let data_page = Page::DataPage {
+                buf: ByteBufferPtr::new(buffer),
+                num_values: page_metrics.num_buffered_values,
+                encoding,
+                def_level_encoding: Encoding::RLE,
+                rep_level_encoding: Encoding::RLE,
+                statistics: page_statistics,
+            };
+
+            CompressedPage::new(data_page, uncompressed_size)
+        }
+        WriterVersion::PARQUET_2_0 => {
+            let mut rep_levels_byte_len = 0;
+            let mut def_levels_byte_len = 0;
+            let mut buffer = vec![];
+
+            if max_rep_level > 0 {
+                let levels = encode_levels_v2(&rep_levels_sink[..], max_rep_level);
+                rep_levels_byte_len = levels.len();
+                buffer.extend_from_slice(&levels[..]);
+            }
+
+            if max_def_level > 0 {
+                let levels = encode_levels_v2(&def_levels_sink[..], max_def_level);
+                def_levels_byte_len = levels.len();
+                buffer.extend_from_slice(&levels[..]);
+            }
+
+            let uncompressed_size =
+                rep_levels_byte_len + def_levels_byte_len + values_data_buf.len();
+
+            // Data Page v2 compresses values only.
+            match compressor {
+                Some(ref mut cmpr) => {
+                    cmpr.compress(values_data_buf.data(), &mut buffer)?;
+                }
+                None => buffer.extend_from_slice(values_data_buf.data()),
+            }
+
+            let data_page = Page::DataPageV2 {
+                buf: ByteBufferPtr::new(buffer),
+                num_values: page_metrics.num_buffered_values,
+                encoding,
+                num_nulls: page_metrics.num_page_nulls as u32,
+                num_rows: page_metrics.num_buffered_rows,
+                def_levels_byte_len: def_levels_byte_len as u32,
+                rep_levels_byte_len: rep_levels_byte_len as u32,
+                is_compressed: compressor.is_some(),
+                statistics: page_statistics,
+            };
+
+            CompressedPage::new(data_page, uncompressed_size)
+        }
+    })
 }
 
 // ----------------------------------------------------------------------
