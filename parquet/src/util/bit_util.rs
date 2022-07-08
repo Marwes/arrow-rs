@@ -412,8 +412,14 @@ impl BitReader {
     ///
     /// Returns `None` if there's not enough data available. `Some` otherwise.
     pub fn get_value<T: FromBytes>(&mut self, num_bits: usize) -> Option<T> {
+        let v = self.get_value_sized(num_bits, size_of::<T>())?;
+        Some(from_ne_slice(v.as_bytes()))
+    }
+
+    #[inline]
+    fn get_value_sized(&mut self, num_bits: usize, size: usize) -> Option<u64> {
         assert!(num_bits <= 64);
-        assert!(num_bits <= size_of::<T>() * 8);
+        assert!(num_bits <= size * 8);
 
         if self.byte_offset * 8 + self.bit_offset + num_bits > self.total_bytes * 8 {
             return None;
@@ -433,7 +439,7 @@ impl BitReader {
         }
 
         // TODO: better to avoid copying here
-        Some(from_ne_slice(v.as_bytes()))
+        Some(v)
     }
 
     /// Skip one value of size `num_bits`.
