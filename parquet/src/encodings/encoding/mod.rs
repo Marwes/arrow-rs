@@ -50,14 +50,7 @@ pub trait Encoder<T: DataType> {
     ///
     /// Returns the number of non-null values encoded.
     fn put_spaced(&mut self, values: &[T::T], valid_bits: &[u8]) -> Result<usize> {
-        let num_values = values.len();
-        let mut buffer = Vec::with_capacity(num_values);
-        // TODO: this is pretty inefficient. Revisit in future.
-        for (i, item) in values.iter().enumerate().take(num_values) {
-            if bit_util::get_bit(valid_bits, i) {
-                buffer.push(item.clone());
-            }
-        }
+        let buffer = put_spaced_default(values, valid_bits);
         self.put(&buffer[..])?;
         Ok(buffer.len())
     }
@@ -72,6 +65,21 @@ pub trait Encoder<T: DataType> {
     /// Flushes the underlying byte buffer that's being processed by this encoder, and
     /// return the immutable copy of it. This will also reset the internal state.
     fn flush_buffer(&mut self) -> Result<ByteBufferPtr>;
+}
+
+fn put_spaced_default<T>(values: &[T], valid_bits: &[u8]) -> Vec<T>
+where
+    T: Clone,
+{
+    let num_values = values.len();
+    let mut buffer = Vec::with_capacity(num_values);
+    // TODO: this is pretty inefficient. Revisit in future.
+    for (i, item) in values.iter().enumerate().take(num_values) {
+        if bit_util::get_bit(valid_bits, i) {
+            buffer.push(item.clone());
+        }
+    }
+    buffer
 }
 
 /// Gets a encoder for the particular data type `T` and encoding `encoding`. Memory usage
